@@ -1,21 +1,21 @@
 package main
 
 import (
+	"fmt"
+	"io/ioutil"
 	"log"
-	"time"
+	"net/http"
 
 	"github.com/Shopify/sarama"
 )
 
 func main() {
-	// Kafkaブローカーのアドレスとポートを設定します
+	// kafka 設定
 	brokers := []string{"kafka-cluster-0.kafka-cluster-headless.kafka.svc.cluster.local:9092"}
 
-	// Kafkaプロデューサーの設定を作成します
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
 
-	// Kafkaブローカーに接続します
 	producer, err := sarama.NewSyncProducer(brokers, config)
 	if err != nil {
 		log.Fatal(err)
@@ -26,16 +26,21 @@ func main() {
 		}
 	}()
 
-	// 5秒ごとにメッセージを送信します
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Echo サーバー起動
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// リクエストのボディを取得します
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
 
-	for range ticker.C {
 		// 送信するメッセージを作成します
 		topic := "topic-otel"
+		msg := fmt.Sprintf("Hello, Kafka x OTel ! message: %s", string(body))
 		message := &sarama.ProducerMessage{
 			Topic: topic,
-			Value: sarama.StringEncoder("Hello, Kafka x OTel !!"),
+			Value: sarama.StringEncoder(msg),
 		}
 
 		// メッセージを送信します
@@ -46,5 +51,10 @@ func main() {
 
 		// 送信結果をログに出力します
 		log.Printf("Message sent topic: %s successfully! Partition: %d, Offset: %d", topic, partition, offset)
-	}
+
+		// レスポンスとして成功を返します
+		w.WriteHeader(http.StatusOK)
+	})
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
