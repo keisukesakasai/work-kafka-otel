@@ -1,60 +1,161 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"sync"
-	"syscall"
+	"strings"
+	"time"
 
 	"github.com/Shopify/sarama"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	_ "time/tzdata"
 )
 
+var tracer = otel.Tracer("kafka-consumer")
+
+func initProvider(ctx context.Context) (func(context.Context) error, error) {
+	var tracerProvider *sdktrace.TracerProvider
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("kafka-consumer"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	conn, err := grpc.DialContext(ctx, "otelcol-collector.observability.svc.cluster.local:4317", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	if err != nil {
+		fmt.Println("failed to create gRPC connection to collector: %w", err)
+	}
+
+	// Set up a trace exporter
+	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trace exporter: %w", err)
+	}
+
+	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+	tracerProvider = sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res),
+		sdktrace.WithSpanProcessor(bsp),
+	)
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	return tracerProvider.Shutdown, nil
+}
+
 func main() {
-	// Kafkaブローカーのアドレスとポートを設定します
-	brokers := []string{"kafka-cluster-0.kafka-cluster-headless.kafka.svc.cluster.local:9092"}
+	// timezone
+	loc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		log.Fatal("%w", err)
+	}
+	log.Printf("%v", loc)
 
-	// Kafkaコンシューマーの設定を作成します
-	config := sarama.NewConfig()
-	config.Consumer.Return.Errors = true
-
-	// Kafkaブローカーに接続します
-	consumer, err := sarama.NewConsumer(brokers, config)
+	// otel 設定
+	ctx := context.Background()
+	shutdown, err := initProvider(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer func() {
-		if err := consumer.Close(); err != nil {
-			log.Fatal(err)
+		if err := shutdown(ctx); err != nil {
+			log.Fatal("failed to shutdown TracerProvider: %w", err)
 		}
 	}()
 
-	// 受信するトピックとパーティションを指定します
-	topic := "topic-otel"
-	partition := int32(0)
+	// Kafkaブローカーのアドレスとポートを設定します
+	brokerList := []string{"kafka-cluster-0.kafka-cluster-headless.kafka.svc.cluster.local:9092"}
+	log.Printf("Kafka brokers: %s", strings.Join(brokerList, ", "))
 
-	// オフセットを指定してパーティションのコンシューマーを作成します
-	partitionConsumer, err := consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
-	if err != nil {
+	// Kafkaブローカーに接続します
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer cancel()
+	if err := startConsumerGroup(ctx, brokerList); err != nil {
 		log.Fatal(err)
 	}
 
-	// メッセージ受信のゴルーチンを開始します
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for msg := range partitionConsumer.Messages() {
-			log.Printf("Received message: Topic = %s, Partition = %d, Offset = %d, Key = %s, Value = %s",
-				msg.Topic, msg.Partition, msg.Offset, string(msg.Key), string(msg.Value))
-		}
-	}()
+	<-ctx.Done()
+}
 
-	// OSのシグナルを待ちます
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	<-signals
+func startConsumerGroup(ctx context.Context, brokerList []string) error {
+	consumerGroupHandler := Consumer{}
+	// Wrap instrumentation
+	handler := otelsarama.WrapConsumerGroupHandler(&consumerGroupHandler)
 
-	// ゴルーチンの終了を待ちます
-	wg.Wait()
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_5_0_0
+	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+
+	// Create consumer group
+	consumerGroup, err := sarama.NewConsumerGroup(brokerList, "example", config)
+	if err != nil {
+		return fmt.Errorf("starting consumer group: %w", err)
+	}
+
+	err = consumerGroup.Consume(ctx, []string{"topic-otel"}, handler)
+	if err != nil {
+		return fmt.Errorf("consuming via handler: %w", err)
+	}
+	return nil
+}
+
+func printMessage(msg *sarama.ConsumerMessage) {
+	// Extract tracing info from message
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), otelsarama.NewConsumerMessageCarrier(msg))
+
+	_, span := tracer.Start(ctx, "consume message", trace.WithAttributes(
+		semconv.MessagingOperationProcess,
+	))
+	defer span.End()
+
+	// Emulate Work loads
+	time.Sleep(10 * time.Millisecond)
+
+	log.Println("Successful to read message: ", string(msg.Value))
+}
+
+// Consumer represents a Sarama consumer group consumer.
+type Consumer struct {
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim.
+func (consumer *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited.
+func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// NOTE:
+	// Do not move the code below to a goroutine.
+	// The `ConsumeClaim` itself is called within a goroutine, see:
+	// https://github.com/Shopify/sarama/blob/master/consumer_group.go#L27-L29
+	for message := range claim.Messages() {
+		printMessage(message)
+		session.MarkMessage(message, "")
+	}
+
+	return nil
 }
