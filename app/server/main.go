@@ -97,8 +97,9 @@ func main() {
 
 func startConsumerGroup(ctx context.Context, brokerList []string) error {
 	consumerGroupHandler := Consumer{}
+	handler := sarama.ConsumerGroupHandler(&consumerGroupHandler)
 	// Wrap instrumentation
-	handler := otelsarama.WrapConsumerGroupHandler(&consumerGroupHandler)
+	// handler := otelsarama.WrapConsumerGroupHandler(&consumerGroupHandler)
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_5_0_0
@@ -120,6 +121,7 @@ func startConsumerGroup(ctx context.Context, brokerList []string) error {
 func printMessage(msg *sarama.ConsumerMessage) {
 	// Extract tracing info from message
 	ctx := otel.GetTextMapPropagator().Extract(context.Background(), otelsarama.NewConsumerMessageCarrier(msg))
+	// ctx := otel.GetTextMapPropagator().Extract(context.Background(), otelsarama.NewConsumerMessageCarrier(&sarama.ConsumerMessage{}))
 
 	_, span := tracer.Start(ctx, "consume message", trace.WithAttributes(
 		semconv.MessagingOperationProcess,
