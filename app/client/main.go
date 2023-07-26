@@ -5,17 +5,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/http"
 	"strings"
-	"time"
 
 	_ "time/tzdata"
 
 	"github.com/Shopify/sarama"
 	"github.com/gin-gonic/gin"
 	otelsarama "go.opentelemetry.io/contrib/instrumentation/github.com/Shopify/sarama/otelsarama"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -59,19 +56,19 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 		sdktrace.WithSpanProcessor(bsp),
 	)
 	otel.SetTracerProvider(tracerProvider)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	// --- W3C TraceContext の場合
+	tc := propagation.TraceContext{}
+	otel.SetTextMapPropagator(tc)
+
+	// --- b3 の場合
+	// p := b3.New()
+	// otel.SetTextMapPropagator(p)
 
 	return tracerProvider.Shutdown, nil
 }
 
 func main() {
-	// timezone 設定
-	loc, err := time.LoadLocation("Asia/Tokyo")
-	if err != nil {
-		log.Fatal("%w", err)
-	}
-	log.Printf("%v", loc)
-
 	// otel 設定
 	ctx := context.Background()
 	shutdown, err := initProvider(ctx)
@@ -90,7 +87,6 @@ func main() {
 
 	// Http server
 	r := gin.New()
-	r.Use(otelgin.Middleware("kafka producer"))
 	r.GET("/", func(c *gin.Context) {
 		// リクエストのボディを取得します
 		_, err := ioutil.ReadAll(c.Request.Body)
@@ -110,14 +106,15 @@ func main() {
 		}
 
 		// 送信するメッセージを作成します
-		rng := rand.New(rand.NewSource(time.Now().Unix()))
 		topic := "topic-otel"
 		msg := sarama.ProducerMessage{
 			Topic: topic,
-			Key:   sarama.StringEncoder("random_number"),
-			Value: sarama.StringEncoder(fmt.Sprintf("%d", rng.Intn(1000))),
 		}
-		otel.GetTextMapPropagator().Inject(ctx, otelsarama.NewProducerMessageCarrier(&msg))
+		carrier := otelsarama.NewProducerMessageCarrier(&msg)
+		tc := otel.GetTextMapPropagator()
+		tc.Inject(ctx, carrier)
+		// carrier に Inject された key=traceparent の value を確認
+		fmt.Println(carrier.Get("traceparent"))
 
 		// メッセージを送信します
 		producer.Input() <- &msg
@@ -137,7 +134,6 @@ func main() {
 func newAccessLogProducer(brokerList []string) (sarama.AsyncProducer, error) {
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_5_0_0
-	// So we can know the partition and offset of messages.
 	config.Producer.Return.Successes = true
 
 	producer, err := sarama.NewAsyncProducer(brokerList, config)
